@@ -34,6 +34,13 @@ var (
     ErrPageUnavailable = errors.New("page is not available")
 )
 
+const (
+    pageUnloadThreshold = 10 * time.Minute
+    cleanupInterval    = 5 * time.Minute
+    maxPagesInMemory   = 100
+    dpiScale           = 300.0 / 250.0
+)
+
 type Config struct {
     PDFs            map[string]string `yaml:"pdfs"`
     Port            int              `yaml:"port"`
@@ -41,10 +48,11 @@ type Config struct {
     ShutdownTimeout time.Duration    `yaml:"shutdown_timeout"`
 }
 
-type Server struct {
-    config     *Config
-    pdfs       map[string]*PDF
-    httpServer *http.Server
+type CropParams struct {
+    width    int
+    height   int
+    topLeftX int
+    topLeftY int
 }
 
 type PageInfo struct {
@@ -54,20 +62,17 @@ type PageInfo struct {
 
 type PDF struct {
     path       string
-    pages      map[int]*PageInfo
+    pages      sync.Map // map[int]*PageInfo with concurrent access
     totalPages int
-    mu         sync.RWMutex
     hash       string
 }
 
-const (
-    // Pages unused for this duration will be unloaded
-    pageUnloadThreshold = 10 * time.Minute
-    // Check for unused pages every this duration
-    cleanupInterval = 5 * time.Minute
-    // Maximum number of pages to keep in memory per PDF
-    maxPagesInMemory = 100
-)
+type Server struct {
+    config     *Config
+    pdfs       map[string]*PDF
+    httpServer *http.Server
+    done       chan struct{}
+}
 
 func NewServer(config *Config) (*Server, error) {
     if err := validateConfig(config); err != nil {
@@ -77,18 +82,12 @@ func NewServer(config *Config) (*Server, error) {
     s := &Server{
         config: config,
         pdfs:   make(map[string]*PDF),
+        done:   make(chan struct{}),
     }
 
-    if err := s.initializeCache(); err != nil {
-        return nil, fmt.Errorf("failed to initialize cache: %w", err)
+    if err := s.initialize(); err != nil {
+        return nil, err
     }
-
-    if err := s.loadPDFs(); err != nil {
-        return nil, fmt.Errorf("failed to load PDFs: %w", err)
-    }
-
-    // Start page cleanup routine
-    go s.startPageCleanup()
 
     return s, nil
 }
@@ -109,30 +108,50 @@ func validateConfig(config *Config) error {
     return nil
 }
 
-func (s *Server) initializeCache() error {
-    return os.MkdirAll(s.config.CacheDir, 0755)
+func (s *Server) initialize() error {
+    if err := os.MkdirAll(s.config.CacheDir, 0755); err != nil {
+        return fmt.Errorf("failed to create cache directory: %w", err)
+    }
+
+    if err := s.loadPDFs(); err != nil {
+        return fmt.Errorf("failed to load PDFs: %w", err)
+    }
+
+    go s.startCleanupRoutine()
+    return nil
 }
 
 func (s *Server) loadPDFs() error {
-    errs := make(chan error, len(s.config.PDFs))
+    type pdfLoadResult struct {
+        id  string
+        pdf *PDF
+        err error
+    }
+
+    results := make(chan pdfLoadResult, len(s.config.PDFs))
     var wg sync.WaitGroup
 
     for id, path := range s.config.PDFs {
         wg.Add(1)
         go func(id, path string) {
             defer wg.Done()
-            if err := s.loadPDF(id, path); err != nil {
-                errs <- fmt.Errorf("failed to load PDF %s: %w", id, err)
-            }
+            pdf, err := s.loadPDF(path)
+            results <- pdfLoadResult{id, pdf, err}
         }(id, path)
     }
 
-    wg.Wait()
-    close(errs)
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
 
     var loadErrors []string
-    for err := range errs {
-        loadErrors = append(loadErrors, err.Error())
+    for result := range results {
+        if result.err != nil {
+            loadErrors = append(loadErrors, fmt.Sprintf("PDF %s: %v", result.id, result.err))
+            continue
+        }
+        s.pdfs[result.id] = result.pdf
     }
 
     if len(loadErrors) > 0 {
@@ -146,46 +165,42 @@ func (s *Server) loadPDFs() error {
     return nil
 }
 
-func (s *Server) loadPDF(id, path string) error {
+func (s *Server) loadPDF(path string) (*PDF, error) {
     hash, err := calculateFileHash(path)
     if err != nil {
-        return fmt.Errorf("hash calculation failed: %w", err)
+        return nil, fmt.Errorf("hash calculation failed: %w", err)
     }
 
     doc, err := fitz.New(path)
     if err != nil {
-        return fmt.Errorf("document creation failed: %w", err)
+        return nil, fmt.Errorf("document creation failed: %w", err)
     }
     defer doc.Close()
 
     pdf := &PDF{
         path:       path,
-        pages:      make(map[int]*PageInfo),
         totalPages: doc.NumPage(),
         hash:       hash,
     }
 
     if err := s.loadPages(pdf, doc); err != nil {
-        return fmt.Errorf("page loading failed: %w", err)
+        return nil, fmt.Errorf("page loading failed: %w", err)
     }
 
-    s.pdfs[id] = pdf
-    return nil
+    return pdf, nil
 }
 
 func (s *Server) loadPages(pdf *PDF, doc *fitz.Document) error {
     numWorkers := runtime.NumCPU()
     jobs := make(chan int, pdf.totalPages)
-    results := make(chan error, pdf.totalPages)
-    var wg sync.WaitGroup
+    errors := make(chan error, pdf.totalPages)
 
-    // Start workers
+    var wg sync.WaitGroup
     for i := 0; i < numWorkers; i++ {
         wg.Add(1)
-        go s.pageWorker(doc, pdf, jobs, results, &wg)
+        go s.pageWorker(pdf, doc, jobs, errors, &wg)
     }
 
-    // Send jobs
     go func() {
         for i := 0; i < pdf.totalPages; i++ {
             jobs <- i
@@ -193,15 +208,13 @@ func (s *Server) loadPages(pdf *PDF, doc *fitz.Document) error {
         close(jobs)
     }()
 
-    // Wait for completion
     go func() {
         wg.Wait()
-        close(results)
+        close(errors)
     }()
 
-    // Collect errors
     var errs []string
-    for err := range results {
+    for err := range errors {
         if err != nil {
             errs = append(errs, err.Error())
         }
@@ -214,28 +227,26 @@ func (s *Server) loadPages(pdf *PDF, doc *fitz.Document) error {
     return nil
 }
 
-func (s *Server) pageWorker(doc *fitz.Document, pdf *PDF, jobs <-chan int, results chan<- error, wg *sync.WaitGroup) {
+func (s *Server) pageWorker(pdf *PDF, doc *fitz.Document, jobs <-chan int, errors chan<- error, wg *sync.WaitGroup) {
     defer wg.Done()
     for pageNum := range jobs {
-        results <- s.processPage(doc, pdf, pageNum)
+        errors <- s.processPage(pdf, doc, pageNum)
     }
 }
 
-func (s *Server) processPage(doc *fitz.Document, pdf *PDF, pageNum int) error {
+func (s *Server) processPage(pdf *PDF, doc *fitz.Document, pageNum int) error {
     cachePath := s.getCachePath(pdf.hash, pageNum)
 
-    // Try loading from cache
+    // Try loading from cache first
     if img, err := s.loadFromCache(cachePath); err == nil {
-        pdf.mu.Lock()
-        pdf.pages[pageNum] = &PageInfo{
+        pdf.pages.Store(pageNum, &PageInfo{
             img:        img,
             lastAccess: time.Now(),
-        }
-        pdf.mu.Unlock()
+        })
         return nil
     }
 
-    // Render from PDF
+    // Render from PDF if not in cache
     img, err := doc.Image(pageNum)
     if err != nil {
         return fmt.Errorf("page %d render failed: %w", pageNum, err)
@@ -243,15 +254,13 @@ func (s *Server) processPage(doc *fitz.Document, pdf *PDF, pageNum int) error {
 
     // Save to cache
     if err := s.saveToCache(img, cachePath); err != nil {
-        log.Printf("Cache save failed for page %d: %v", pageNum, err)
+        log.Printf("Warning: cache save failed for page %d: %v", pageNum, err)
     }
 
-    pdf.mu.Lock()
-    pdf.pages[pageNum] = &PageInfo{
+    pdf.pages.Store(pageNum, &PageInfo{
         img:        img,
         lastAccess: time.Now(),
-    }
-    pdf.mu.Unlock()
+    })
 
     return nil
 }
@@ -291,29 +300,58 @@ func (s *Server) saveToCache(img image.Image, path string) error {
     return os.Rename(tmpPath, path)
 }
 
-type CropParams struct {
-    width    int
-    height   int
-    topLeftX int
-    topLeftY int
+func (s *Server) startCleanupRoutine() {
+    ticker := time.NewTicker(cleanupInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            s.cleanupUnusedPages()
+        case <-s.done:
+            return
+        }
+    }
 }
 
-func parseCropParams(query map[string][]string) *CropParams {
-    getIntParam := func(name string) int {
-        if values := query[name]; len(values) > 0 {
-            if val, err := strconv.Atoi(values[0]); err == nil {
-                return val
-            }
-        }
-        return 0
-    }
+func (s *Server) cleanupUnusedPages() {
+    threshold := time.Now().Add(-pageUnloadThreshold)
 
-    scale := 300.0 / 250.0
-    return &CropParams{
-        width:    int(float64(getIntParam("width")) * scale),
-        height:   int(float64(getIntParam("height")) * scale),
-        topLeftX: int(float64(getIntParam("top_left_x")) * scale),
-        topLeftY: int(float64(getIntParam("top_left_y")) * scale),
+    for _, pdf := range s.pdfs {
+        var pages []struct {
+            num   int
+            info  *PageInfo
+        }
+
+        // Collect pages
+        pdf.pages.Range(func(key, value interface{}) bool {
+            pageNum := key.(int)
+            pageInfo := value.(*PageInfo)
+            pages = append(pages, struct {
+                num   int
+                info  *PageInfo
+            }{pageNum, pageInfo})
+            return true
+        })
+
+        // Sort by last access time
+        sort.Slice(pages, func(i, j int) bool {
+            return pages[i].info.lastAccess.Before(pages[j].info.lastAccess)
+        })
+
+        // Remove old pages and ensure we don't exceed maxPagesInMemory
+        removed := 0
+        for _, p := range pages {
+            if len(pages)-removed <= maxPagesInMemory && p.info.lastAccess.After(threshold) {
+                break
+            }
+            pdf.pages.Delete(p.num)
+            removed++
+        }
+
+        if removed > 0 {
+            log.Printf("Unloaded %d pages from PDF %s", removed, pdf.path)
+        }
     }
 }
 
@@ -334,36 +372,30 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    pdf.mu.RLock()
-    pageInfo, ok := pdf.pages[page-1]
-    if ok {
-        pageInfo.lastAccess = time.Now()
-    }
-    pdf.mu.RUnlock()
-
+    pageNum := page - 1
+    value, ok := pdf.pages.Load(pageNum)
     var img image.Image
+
     if !ok {
-        // Try to load from cache if not in memory
-        cachePath := s.getCachePath(pdf.hash, page-1)
+        // Try to load from cache
+        cachePath := s.getCachePath(pdf.hash, pageNum)
         var err error
-        img, err = s.loadFromCache(cachePath)
-        if err != nil {
+        if img, err = s.loadFromCache(cachePath); err != nil {
             http.Error(w, ErrPageUnavailable.Error(), http.StatusNotFound)
             return
         }
-        
-        pdf.mu.Lock()
-        pdf.pages[page-1] = &PageInfo{
+        pdf.pages.Store(pageNum, &PageInfo{
             img:        img,
             lastAccess: time.Now(),
-        }
-        pdf.mu.Unlock()
+        })
     } else {
+        pageInfo := value.(*PageInfo)
+        pageInfo.lastAccess = time.Now()
         img = pageInfo.img
     }
 
     crop := parseCropParams(r.URL.Query())
-    croppedImg, err := cropImage(img, crop)
+    result, err := cropImage(img, crop)
     if err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
@@ -371,7 +403,25 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 
     w.Header().Set("Content-Type", "image/jpeg")
     w.Header().Set("Cache-Control", "public, max-age=86400")
-    jpeg.Encode(w, croppedImg, &jpeg.Options{Quality: 90})
+    jpeg.Encode(w, result, &jpeg.Options{Quality: 90})
+}
+
+func parseCropParams(query map[string][]string) *CropParams {
+    getIntParam := func(name string) int {
+        if values := query[name]; len(values) > 0 {
+            if val, err := strconv.Atoi(values[0]); err == nil {
+                return val
+            }
+        }
+        return 0
+    }
+
+    return &CropParams{
+        width:    int(float64(getIntParam("width")) * dpiScale),
+        height:   int(float64(getIntParam("height")) * dpiScale),
+        topLeftX: int(float64(getIntParam("top_left_x")) * dpiScale),
+        topLeftY: int(float64(getIntParam("top_left_y")) * dpiScale),
+    }
 }
 
 func cropImage(img image.Image, crop *CropParams) (image.Image, error) {
@@ -414,62 +464,8 @@ func (s *Server) Start() error {
     return nil
 }
 
-func (s *Server) startPageCleanup() {
-    ticker := time.NewTicker(cleanupInterval)
-    defer ticker.Stop()
-
-    for range ticker.C {
-        s.cleanupUnusedPages()
-    }
-}
-
-func (s *Server) cleanupUnusedPages() {
-    now := time.Now()
-    threshold := now.Add(-pageUnloadThreshold)
-
-    for _, pdf := range s.pdfs {
-        pdf.mu.Lock()
-
-        // Count pages and find oldest accesses
-        type pageAccess struct {
-            pageNum    int
-            lastAccess time.Time
-        }
-        var accesses []pageAccess
-        for pageNum, page := range pdf.pages {
-            accesses = append(accesses, pageAccess{
-                pageNum:    pageNum,
-                lastAccess: page.lastAccess,
-            })
-        }
-
-        // Sort by last access time, oldest first
-        sort.Slice(accesses, func(i, j int) bool {
-            return accesses[i].lastAccess.Before(accesses[j].lastAccess)
-        })
-
-        // Remove old pages and ensure we don't exceed maxPagesInMemory
-        pagesRemoved := 0
-        for _, pa := range accesses {
-            if len(pdf.pages) <= maxPagesInMemory {
-                // If we're under the limit, only remove very old pages
-                if pa.lastAccess.After(threshold) {
-                    break
-                }
-            }
-            delete(pdf.pages, pa.pageNum)
-            pagesRemoved++
-        }
-
-        pdf.mu.Unlock()
-
-        if pagesRemoved > 0 {
-            log.Printf("Unloaded %d pages from PDF %s", pagesRemoved, pdf.path)
-        }
-    }
-}
-
 func (s *Server) Shutdown(ctx context.Context) error {
+    close(s.done)
     return s.httpServer.Shutdown(ctx)
 }
 
@@ -493,6 +489,8 @@ func main() {
         log.Fatal("Usage: program <config_file>")
     }
 
+    log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
     configData, err := os.ReadFile(os.Args[1])
     if err != nil {
         log.Fatalf("Failed to read config: %v", err)
@@ -508,16 +506,26 @@ func main() {
         log.Fatalf("Failed to create server: %v", err)
     }
 
+    // Handle graceful shutdown
+    serverErr := make(chan error, 1)
     go func() {
         if err := server.Start(); err != nil {
-            log.Printf("Server error: %v", err)
+            serverErr <- err
         }
     }()
 
+    // Wait for interrupt or server error
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-    <-sigChan
 
+    select {
+    case err := <-serverErr:
+        log.Printf("Server error: %v", err)
+    case sig := <-sigChan:
+        log.Printf("Received signal: %v", sig)
+    }
+
+    // Graceful shutdown
     shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
     defer cancel()
 
