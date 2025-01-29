@@ -1,0 +1,12 @@
+github.com/ebitengine/purego v0.8.0 h1:JbqvnEzRvPpxhCJzJJ2y0RbiZ8nyjccVUrSM3q+GvvE=
+github.com/ebitengine/purego v0.8.0/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
+github.com/gen2brain/go-fitz v1.24.14 h1:09weRkjVtLYNGo7l0J7DyOwBExbwi8SJ9h8YPhw9WEo=
+github.com/gen2brain/go-fitz v1.24.14/go.mod h1:0KaZeQgASc20Yp5R/pFzyy7SmP01XcoHKNF842U2/S4=
+github.com/gorilla/mux v1.8.1 h1:TuBL49tXwgrFYWhqrNgrUNEY92u81SPhu7sTdzQEiWY=
+github.com/gorilla/mux v1.8.1/go.mod h1:AKf9I4AEqPTmMytcMc0KkNouC66V3BtZ4qD5fmWSiMQ=
+github.com/jupiterrider/ffi v0.2.0 h1:tMM70PexgYNmV+WyaYhJgCvQAvtTCs3wXeILPutihnA=
+github.com/jupiterrider/ffi v0.2.0/go.mod h1:yqYqX5DdEccAsHeMn+6owkoI2llBLySVAF8dwCDZPVs=
+github.com/karmdip-mi/go-fitz v0.0.0-20210702102225-a530a79566e9 h1:w2zV18MDGv67JnuHgNQk7CG6ipj9HEBtuZGwy6TrJEE=
+github.com/karmdip-mi/go-fitz v0.0.0-20210702102225-a530a79566e9/go.mod h1:2aHtXmu2gpljEpoBoFMFr+C5GpdHIT8aI1l1UcyvEP4=
+gopkg.in/yaml.v2 v2.4.0 h1:D8xgwECY7CYvx+Y2n4sBz93Jn9JRvxdiyyo8CTfuKaY=
+gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
