@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Image Selection Tool</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            min-height: calc(100vh - 40px);
+            position: relative;
+        }
+        .url-input {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            transition: border-color 0.2s;
+        }
+        .url-input:focus {
+            border-color: #0066cc;
+            outline: none;
+        }
+        .canvas-container {
+            position: relative;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 20px 0;
+            background: #f8f9fa;
+        }
+        canvas {
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }
+        .coords {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 14px;
+            z-index: 1000;
+        }
+        .button-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 1000;
+        }
+        .button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .button:hover {
+            transform: translateY(-1px);
+        }
+        .button.primary {
+            background: #0066cc;
+            color: white;
+        }
+        .button.primary:hover {
+            background: #0052a3;
+        }
+        .button.secondary {
+            background: #6c757d;
+            color: white;
+        }
+        .button.secondary:hover {
+            background: #5a6268;
+        }
+        .button.copy {
+            background: #28a745;
+            color: white;
+        }
+        .button.copy:hover {
+            background: #218838;
+        }
+        .result {
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            max-width: 600px;
+            word-break: break-all;
+            font-family: monospace;
+            font-size: 14px;
+            display: none;
+        }
+        @media (max-width: 768px) {
+            .button-container {
+                flex-direction: column;
+            }
+            .result {
+                bottom: 160px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <input type="text" 
+               id="urlInput" 
+               class="url-input" 
+               placeholder="Paste image URL here..."
+               oninput="onUrlInput()">
+        <div class="canvas-container">
+            <canvas id="canvas"></canvas>
+        </div>
+    </div>
+    <div id="coords" class="coords" style="display: none;"></div>
+    <div id="result" class="result"></div>
+    <div class="button-container">
+        <button onclick="copyUrl()" class="button copy" id="copyButton" style="display: none;">
+            📋 Copy URL
+        </button>
+        <button onclick="revertToOriginal()" class="button secondary" id="revertButton" style="display: none;">
+            ↺ Revert
+        </button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let isSelecting = false;
+        let startPoint = { x: 0, y: 0 };
+        let selection = { x: 0, y: 0, width: 0, height: 0 };
+        let originalSelection = null;
+        let image = null;
+        let baseUrl = '';
+        let isDragging = false;
+        let isResizing = false;
+        let resizeHandle = '';
+        const dpiScale = 300/250;
+        const handleSize = 10;
+
+        function onUrlInput() {
+            const url = document.getElementById('urlInput').value;
+            if (url.includes('http')) {
+                loadImage(url);
+            }
+        }
+
+        function loadImage(url = null) {
+            const inputUrl = url || document.getElementById('urlInput').value;
+            if (!inputUrl) return;
+
+            try {
+                const urlObj = new URL(inputUrl);
+                const params = new URLSearchParams(urlObj.search);
+                baseUrl = urlObj.origin + urlObj.pathname;
+
+                const newSelection = {
+                    x: (parseInt(params.get('top_left_x')) || 0) * dpiScale,
+                    y: (parseInt(params.get('top_left_y')) || 0) * dpiScale,
+                    width: (parseInt(params.get('width')) || 0) * dpiScale,
+                    height: (parseInt(params.get('height')) || 0) * dpiScale
+                };
+
+                image = new Image();
+                image.crossOrigin = 'anonymous';
+                image.src = baseUrl;
+                image.onload = () => {
+                    canvas.width = image.width;
+                    canvas.height = image.height;
+                    selection = newSelection;
+                    originalSelection = {...newSelection};
+                    drawImage();
+                    document.getElementById('revertButton').style.display = 'block';
+                };
+            } catch (e) {
+                console.error('Invalid URL:', e);
+            }
+        }
+
+        function drawImage() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(image, 0, 0);
+            
+            // Draw semi-transparent overlay outside selection
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+            const path = new Path2D();
+            path.rect(0, 0, canvas.width, canvas.height);
+            path.rect(selection.x, selection.y, selection.width, selection.height);
+            ctx.fill(path, 'evenodd');
+            
+            // Draw selection border and handles
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(selection.x, selection.y, selection.width, selection.height);
+            
+            // Draw resize handles
+            const handleSize = 10;
+            ctx.fillStyle = '#00ff00';
+            
+            // Corner handles
+            ctx.fillRect(selection.x - handleSize/2, selection.y - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x + selection.width - handleSize/2, selection.y - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x - handleSize/2, selection.y + selection.height - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x + selection.width - handleSize/2, selection.y + selection.height - handleSize/2, handleSize, handleSize);
+            
+            // Edge handles
+            ctx.fillRect(selection.x + selection.width/2 - handleSize/2, selection.y - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x + selection.width/2 - handleSize/2, selection.y + selection.height - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x - handleSize/2, selection.y + selection.height/2 - handleSize/2, handleSize, handleSize);
+            ctx.fillRect(selection.x + selection.width - handleSize/2, selection.y + selection.height/2 - handleSize/2, handleSize, handleSize);
+            
+            updateResult();
+        }
+
+        function getMousePos(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            return {
+                x: Math.round((e.clientX - rect.left) * scaleX),
+                y: Math.round((e.clientY - rect.top) * scaleY)
+            };
+        }
+
+        function updateResult() {
+            if (!baseUrl) return;
+            const params = new URLSearchParams();
+            params.set('top_left_x', Math.round(selection.x / dpiScale));
+            params.set('top_left_y', Math.round(selection.y / dpiScale));
+            params.set('width', Math.round(selection.width / dpiScale));
+            params.set('height', Math.round(selection.height / dpiScale));
+            const resultUrl = `${baseUrl}?${params.toString()}`;
+            const resultDiv = document.getElementById('result');
+            resultDiv.style.display = 'block';
+            resultDiv.textContent = resultUrl;
+            document.getElementById('copyButton').style.display = 'block';
+        }
+
+        function updateCoords(pos) {
+            const coordsDiv = document.getElementById('coords');
+            coordsDiv.style.display = 'block';
+            const urlX = Math.round(pos.x / dpiScale);
+            const urlY = Math.round(pos.y / dpiScale);
+            const width = Math.round(selection.width / dpiScale);
+            const height = Math.round(selection.height / dpiScale);
+            coordsDiv.textContent = `X: ${urlX} Y: ${urlY} (${width}x${height})`;
+        }
+
+        function revertToOriginal() {
+            if (originalSelection) {
+                selection = {...originalSelection};
+                drawImage();
+            }
+        }
+
+        async function copyUrl() {
+            const resultDiv = document.getElementById('result');
+            try {
+                await navigator.clipboard.writeText(resultDiv.textContent);
+                const copyButton = document.getElementById('copyButton');
+                copyButton.textContent = '✓ Copied!';
+                setTimeout(() => {
+                    copyButton.textContent = '📋 Copy URL';
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy:', err);
+            }
+        }
+
+        function getHandle(pos) {
+            if (!selection.width || !selection.height) return '';
+            
+            const { x, y } = pos;
+            const handleHitbox = handleSize * 2;
+
+            // Check corners first
+            if (Math.abs(x - selection.x) <= handleHitbox && Math.abs(y - selection.y) <= handleHitbox) return 'nw';
+            if (Math.abs(x - (selection.x + selection.width)) <= handleHitbox && Math.abs(y - selection.y) <= handleHitbox) return 'ne';
+            if (Math.abs(x - selection.x) <= handleHitbox && Math.abs(y - (selection.y + selection.height)) <= handleHitbox) return 'sw';
+            if (Math.abs(x - (selection.x + selection.width)) <= handleHitbox && Math.abs(y - (selection.y + selection.height)) <= handleHitbox) return 'se';
+
+            // Then check edges
+            if (Math.abs(y - selection.y) <= handleHitbox && x > selection.x && x < selection.x + selection.width) return 'n';
+            if (Math.abs(y - (selection.y + selection.height)) <= handleHitbox && x > selection.x && x < selection.x + selection.width) return 's';
+            if (Math.abs(x - selection.x) <= handleHitbox && y > selection.y && y < selection.y + selection.height) return 'w';
+            if (Math.abs(x - (selection.x + selection.width)) <= handleHitbox && y > selection.y && y < selection.y + selection.height) return 'e';
+
+            // Check if inside selection
+            if (x > selection.x && x < selection.x + selection.width && y > selection.y && y < selection.y + selection.height) return 'move';
+
+            return '';
+        }
+
+        function updateCursor(handle) {
+            let cursor = 'default';
+            switch(handle) {
+                case 'nw':
+                case 'se': cursor = 'nwse-resize'; break;
+                case 'ne':
+                case 'sw': cursor = 'nesw-resize'; break;
+                case 'n':
+                case 's': cursor = 'ns-resize'; break;
+                case 'e':
+                case 'w': cursor = 'ew-resize'; break;
+                case 'move': cursor = 'move'; break;
+            }
+            canvas.style.cursor = cursor;
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!image) return;
+            const pos = getMousePos(e);
+            const handle = getHandle(pos);
+
+            if (handle === 'move') {
+                isDragging = true;
+                startPoint = { 
+                    x: pos.x - selection.x, 
+                    y: pos.y - selection.y 
+                };
+            } else if (handle) {
+                isResizing = true;
+                resizeHandle = handle;
+                startPoint = pos;
+            } else {
+                isSelecting = true;
+                startPoint = pos;
+                selection = { x: pos.x, y: pos.y, width: 0, height: 0 };
+            }
+            drawImage();
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const pos = getMousePos(e);
+            updateCoords(pos);
+            
+            if (!image) return;
+
+            if (!isSelecting && !isDragging && !isResizing) {
+                updateCursor(getHandle(pos));
+                return;
+            }
+
+            if (isDragging) {
+                selection.x = pos.x - startPoint.x;
+                selection.y = pos.y - startPoint.y;
+            } else if (isResizing) {
+                const deltaX = pos.x - startPoint.x;
+                const deltaY = pos.y - startPoint.y;
+                
+                switch(resizeHandle) {
+                    case 'e':
+                        selection.width += deltaX;
+                        break;
+                    case 'w':
+                        selection.width -= deltaX;
+                        selection.x += deltaX;
+                        break;
+                    case 's':
+                        selection.height += deltaY;
+                        break;
+                    case 'n':
+                        selection.height -= deltaY;
+                        selection.y += deltaY;
+                        break;
+                    case 'se':
+                        selection.width += deltaX;
+                        selection.height += deltaY;
+                        break;
+                    case 'sw':
+                        selection.width -= deltaX;
+                        selection.x += deltaX;
+                        selection.height += deltaY;
+                        break;
+                    case 'ne':
+                        selection.width += deltaX;
+                        selection.height -= deltaY;
+                        selection.y += deltaY;
+                        break;
+                    case 'nw':
+                        selection.width -= deltaX;
+                        selection.x += deltaX;
+                        selection.height -= deltaY;
+                        selection.y += deltaY;
+                        break;
+                }
+                startPoint = pos;
+            } else if (isSelecting) {
+                selection = {
+                    x: Math.min(pos.x, startPoint.x),
+                    y: Math.min(pos.y, startPoint.y),
+                    width: Math.abs(pos.x - startPoint.x),
+                    height: Math.abs(pos.y - startPoint.y)
+                };
+            }
+            
+            // Ensure selection stays within image bounds
+            if (selection.x < 0) selection.x = 0;
+            if (selection.y < 0) selection.y = 0;
+            if (selection.x + selection.width > canvas.width) selection.width = canvas.width - selection.x;
+            if (selection.y + selection.height > canvas.height) selection.height = canvas.height - selection.y;
+            
+            drawImage();
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isSelecting = false;
+            isDragging = false;
+            isResizing = false;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            isSelecting = false;
+            isDragging = false;
+            isResizing = false;
+            document.getElementById('coords').style.display = 'none';
+        });
+    </script>
+</body>
+</html>
