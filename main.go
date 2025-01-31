@@ -53,6 +53,7 @@ type CropParams struct {
     height   int
     topLeftX int
     topLeftY int
+    rotation int // degrees, clockwise
 }
 
 type PageInfo struct {
@@ -421,13 +422,14 @@ func parseCropParams(query map[string][]string) *CropParams {
         height:   int(float64(getIntParam("height")) * dpiScale),
         topLeftX: int(float64(getIntParam("top_left_x")) * dpiScale),
         topLeftY: int(float64(getIntParam("top_left_y")) * dpiScale),
+        rotation: getIntParam("rotation"),
     }
 }
 
 func cropImage(img image.Image, crop *CropParams) (image.Image, error) {
     bounds := img.Bounds()
     
-    if crop.width == 0 && crop.height == 0 && crop.topLeftX == 0 && crop.topLeftY == 0 {
+    if crop.width == 0 && crop.height == 0 && crop.topLeftX == 0 && crop.topLeftY == 0 && crop.rotation == 0 {
         return img, nil
     }
 
@@ -435,6 +437,7 @@ func cropImage(img image.Image, crop *CropParams) (image.Image, error) {
         return nil, ErrInvalidCrop
     }
 
+    // First crop
     cropped := image.NewRGBA(image.Rect(0, 0, crop.width, crop.height))
     for y := 0; y < crop.height; y++ {
         for x := 0; x < crop.width; x++ {
@@ -442,8 +445,58 @@ func cropImage(img image.Image, crop *CropParams) (image.Image, error) {
         }
     }
 
+    // Then rotate if needed
+    if crop.rotation != 0 {
+        return rotateImage(cropped, crop.rotation)
+    }
+
     return cropped, nil
 }
+
+func rotateImage(img image.Image, degrees int) (image.Image, error) {
+    // Normalize rotation to 0-359
+    degrees = ((degrees % 360) + 360) % 360
+    
+    // Fast path for no rotation
+    if degrees == 0 {
+        return img, nil
+    }
+
+    bounds := img.Bounds()
+    width, height := bounds.Max.X, bounds.Max.Y
+    
+    // Fast path for 90/180/270 degrees
+    var rotated *image.RGBA
+    switch degrees {
+    case 90:
+        rotated = image.NewRGBA(image.Rect(0, 0, height, width))
+        for y := 0; y < height; y++ {
+            for x := 0; x < width; x++ {
+                rotated.Set(height-y-1, x, img.At(x, y))
+            }
+        }
+    case 180:
+        rotated = image.NewRGBA(image.Rect(0, 0, width, height))
+        for y := 0; y < height; y++ {
+            for x := 0; x < width; x++ {
+                rotated.Set(width-x-1, height-y-1, img.At(x, y))
+            }
+        }
+    case 270:
+        rotated = image.NewRGBA(image.Rect(0, 0, height, width))
+        for y := 0; y < height; y++ {
+            for x := 0; x < width; x++ {
+                rotated.Set(y, width-x-1, img.At(x, y))
+            }
+        }
+    default:
+        // For arbitrary angles, we'd need a more complex transformation
+        return nil, fmt.Errorf("rotation angle %d not supported (only 0, 90, 180, 270 allowed)", degrees)
+    }
+
+    return rotated, nil
+}
+
 
 func (s *Server) Start() error {
     router := mux.NewRouter()
